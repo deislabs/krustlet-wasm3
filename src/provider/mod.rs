@@ -27,12 +27,14 @@
 //!     kubelet.start().await.unwrap();
 //! };
 //! ```
+use std::path::PathBuf;
 
 use k8s_openapi::api::core::v1::Pod as KubePod;
 use kube::api::DeleteParams;
 use kube::Api;
 use kube::Config as KubeConfig;
-use kubelet::handle::{key_from_pod, pod_key};
+use kubelet::config::Config as KubeletConfig;
+use kubelet::handle::{key_from_pod, pod_key, PodHandle};
 use kubelet::module_store::ModuleStore;
 use kubelet::provider::ProviderError;
 use kubelet::Pod;
@@ -42,26 +44,31 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 mod runtime;
-use runtime::Runtime;
+use runtime::{HandleStopper, LogHandleFactory, Runtime};
 
 const TARGET_WASM32_WASI: &str = "wasm32-wasi";
+const LOG_DIR_NAME: &str = "wasm3-logs";
 
 /// Provider provides a Kubelet runtime implementation that executes WASM
 /// binaries conforming to the WASI spec
 pub struct Provider<S> {
-    pods: Arc<RwLock<HashMap<String, HashMap<String, Runtime>>>>,
+    handles: Arc<RwLock<HashMap<String, PodHandle<HandleStopper, LogHandleFactory>>>>,
     store: S,
+    log_path: PathBuf,
     kubeconfig: KubeConfig,
 }
 
 impl<S: ModuleStore + Send + Sync> Provider<S> {
     /// Create a new wasi provider from a module store and a kubelet config
-    pub fn new(store: S, kubeconfig: KubeConfig) -> Self {
-        Self {
-            pods: Default::default(),
+    pub async fn new(store: S, config: &KubeletConfig, kubeconfig: KubeConfig) -> anyhow::Result<Self> {
+        let log_path = config.data_dir.join(LOG_DIR_NAME);
+        tokio::fs::create_dir_all(&log_path).await?;
+        Ok(Self {
+            handles: Default::default(),
             store,
+            log_path,
             kubeconfig,
-        }
+        })
     }
 }
 
@@ -77,6 +84,7 @@ impl<S: ModuleStore + Send + Sync> kubelet::Provider for Provider<S> {
 
         let pod_name = pod.name();
         let mut containers = HashMap::new();
+        let client = kube::Client::new(self.kubeconfig.clone());
 
         let mut modules = self.store.fetch_pod_modules(&pod).await?;
         info!("Starting containers for pod {:?}", pod_name);
@@ -86,11 +94,11 @@ impl<S: ModuleStore + Send + Sync> kubelet::Provider for Provider<S> {
                 .expect("FATAL ERROR: module map not properly populated");
 
             // TODO: expose this as a feature flag (--stack-size)
-            let mut runtime = Runtime::new(module_data, (1024 * 60) as u32);
+            let mut runtime = Runtime::new(module_data, (1024 * 60) as u32, self.log_path.clone()).await?;
 
             debug!("Starting container {} on thread", container.name);
-            runtime.start()?;
-            containers.insert(container.name.clone(), runtime);
+            let handle = runtime.start().await?;
+            containers.insert(container.name.clone(), handle);
         }
         info!(
             "All containers started for pod {:?}. Updating status",
@@ -100,8 +108,11 @@ impl<S: ModuleStore + Send + Sync> kubelet::Provider for Provider<S> {
         // Wrap this in a block so the write lock goes out of scope when we are done
         {
             // Grab the entry while we are creating things
-            let mut pods = self.pods.write().await;
-            pods.insert(key_from_pod(&pod), containers);
+            let mut handles = self.handles.write().await;
+            handles.insert(
+                key_from_pod(&pod),
+                PodHandle::new(containers, pod, client, None)?,
+            );
         }
 
         Ok(())
@@ -122,12 +133,10 @@ impl<S: ModuleStore + Send + Sync> kubelet::Provider for Provider<S> {
         );
         trace!("Modified pod spec: {:#?}", pod.as_kube_pod());
         if let Some(_timestamp) = pod.deletion_timestamp() {
-            let mut pods = self.pods.write().await;
-            match pods.get_mut(&key_from_pod(&pod)) {
+            let mut handles = self.handles.write().await;
+            match handles.get_mut(&key_from_pod(&pod)) {
                 Some(h) => {
-                    for (_name, runtime) in h {
-                        runtime.stop()?;
-                    }
+                    h.stop().await?;
                     // Follow up with a delete when everything is stopped
                     let dp = DeleteParams {
                         grace_period_seconds: Some(0),
@@ -162,8 +171,8 @@ impl<S: ModuleStore + Send + Sync> kubelet::Provider for Provider<S> {
     }
 
     async fn delete(&self, pod: Pod) -> anyhow::Result<()> {
-        let mut pods = self.pods.write().await;
-        match pods.remove(&key_from_pod(&pod)) {
+        let mut handles = self.handles.write().await;
+        match handles.remove(&key_from_pod(&pod)) {
             Some(_) => debug!(
                 "Pod {} in namespace {} removed",
                 pod.name(),
@@ -185,8 +194,8 @@ impl<S: ModuleStore + Send + Sync> kubelet::Provider for Provider<S> {
         _container_name: String,
         _sender: kubelet::LogSender,
     ) -> anyhow::Result<()> {
-        let mut pods = self.pods.write().await;
-        let _containers = pods
+        let mut handles = self.handles.write().await;
+        let _containers = handles
             .get_mut(&pod_key(&namespace, &pod_name))
             .ok_or_else(|| ProviderError::PodNotFound {
                 pod_name: pod_name.clone(),

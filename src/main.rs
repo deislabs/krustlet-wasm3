@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
     module_store_path.push("modules");
     let store = FileModuleStore::new(client, &module_store_path);
 
-    let provider = Provider::new(store, kubeconfig.clone());
+    let provider = Provider::new(store, &config, kubeconfig.clone()).await?;
     let kubelet = Kubelet::new(provider, kubeconfig, config);
     kubelet.start().await
 }
