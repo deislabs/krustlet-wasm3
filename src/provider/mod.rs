@@ -28,11 +28,15 @@
 //! };
 //! ```
 
+use k8s_openapi::api::core::v1::Pod as KubePod;
+use kube::api::DeleteParams;
+use kube::Api;
+use kube::Config as KubeConfig;
 use kubelet::handle::{key_from_pod, pod_key};
 use kubelet::module_store::ModuleStore;
 use kubelet::provider::ProviderError;
 use kubelet::Pod;
-use log::{debug, info};
+use log::{debug, error, info, trace};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -47,14 +51,16 @@ const TARGET_WASM32_WASI: &str = "wasm32-wasi";
 pub struct Provider<S> {
     pods: Arc<RwLock<HashMap<String, HashMap<String, Runtime>>>>,
     store: S,
+    kubeconfig: KubeConfig,
 }
 
 impl<S: ModuleStore + Send + Sync> Provider<S> {
     /// Create a new wasi provider from a module store and a kubelet config
-    pub fn new(store: S) -> Self {
+    pub fn new(store: S, kubeconfig: KubeConfig) -> Self {
         Self {
             pods: Default::default(),
             store,
+            kubeconfig,
         }
     }
 }
@@ -79,7 +85,8 @@ impl<S: ModuleStore + Send + Sync> kubelet::Provider for Provider<S> {
                 .remove(&container.name)
                 .expect("FATAL ERROR: module map not properly populated");
 
-            let mut runtime = Runtime::new(module_data, 1 as u32);
+            // TODO: expose this as a feature flag (--stack-size)
+            let mut runtime = Runtime::new(module_data, (1024 * 60) as u32);
 
             debug!("Starting container {} on thread", container.name);
             runtime.start()?;
@@ -100,12 +107,75 @@ impl<S: ModuleStore + Send + Sync> kubelet::Provider for Provider<S> {
         Ok(())
     }
 
-    async fn modify(&self, _pod: Pod) -> anyhow::Result<()> {
-        unimplemented!()
+    async fn modify(&self, pod: Pod) -> anyhow::Result<()> {
+        // The only things we care about are:
+        // 1. metadata.deletionTimestamp => signal all containers to stop and then mark them
+        //    as terminated
+        // 2. spec.containers[*].image, spec.initContainers[*].image => stop the currently
+        //    running containers and start new ones?
+        // 3. spec.activeDeadlineSeconds => Leaving unimplemented for now
+        // TODO: Determine what the proper behavior should be if labels change
+        debug!(
+            "Got pod modified event for {} in namespace {}",
+            pod.name(),
+            pod.namespace()
+        );
+        trace!("Modified pod spec: {:#?}", pod.as_kube_pod());
+        if let Some(_timestamp) = pod.deletion_timestamp() {
+            let mut pods = self.pods.write().await;
+            match pods.get_mut(&key_from_pod(&pod)) {
+                Some(h) => {
+                    for (_name, runtime) in h {
+                        runtime.stop()?;
+                    }
+                    // Follow up with a delete when everything is stopped
+                    let dp = DeleteParams {
+                        grace_period_seconds: Some(0),
+                        ..Default::default()
+                    };
+                    let pod_client: Api<KubePod> = Api::namespaced(
+                        kube::client::Client::new(self.kubeconfig.clone()),
+                        pod.namespace(),
+                    );
+                    match pod_client.delete(pod.name(), &dp).await {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(e.into()),
+                    }
+                }
+                None => {
+                    // This isn't an error with the pod, so don't return an error (otherwise it will
+                    // get updated in its status). This is an unlikely case to get into and means
+                    // that something is likely out of sync, so just log the error
+                    error!(
+                        "Unable to find pod {} in namespace {} when trying to stop all containers",
+                        pod.name(),
+                        pod.namespace()
+                    );
+                    Ok(())
+                }
+            }
+        } else {
+            Ok(())
+        }
+        // TODO: Implement behavior for stopping old containers and restarting when the container
+        // image changes
     }
 
-    async fn delete(&self, _pod: Pod) -> anyhow::Result<()> {
-        unimplemented!()
+    async fn delete(&self, pod: Pod) -> anyhow::Result<()> {
+        let mut pods = self.pods.write().await;
+        match pods.remove(&key_from_pod(&pod)) {
+            Some(_) => debug!(
+                "Pod {} in namespace {} removed",
+                pod.name(),
+                pod.namespace()
+            ),
+            None => info!(
+                "unable to find pod {} in namespace {}, it was likely already deleted",
+                pod.name(),
+                pod.namespace()
+            ),
+        }
+        Ok(())
     }
 
     async fn logs(
@@ -116,7 +186,7 @@ impl<S: ModuleStore + Send + Sync> kubelet::Provider for Provider<S> {
         _sender: kubelet::LogSender,
     ) -> anyhow::Result<()> {
         let mut pods = self.pods.write().await;
-        let _pod = pods
+        let _containers = pods
             .get_mut(&pod_key(&namespace, &pod_name))
             .ok_or_else(|| ProviderError::PodNotFound {
                 pod_name: pod_name.clone(),

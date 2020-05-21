@@ -3,18 +3,13 @@ use kubelet::module_store::FileModuleStore;
 use kubelet::Kubelet;
 
 mod provider;
-
 use provider::Provider;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // The provider is responsible for all the "back end" logic. If you are creating
-    // a new Kubelet, all you need to implement is a provider.
     let config = Config::new_from_flags(env!("CARGO_PKG_VERSION"));
-
     let kubeconfig = kube::Config::infer().await?;
 
-    // Initialize the logger
     env_logger::init();
 
     let client = oci_distribution::Client::default();
@@ -22,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
     module_store_path.push("modules");
     let store = FileModuleStore::new(client, &module_store_path);
 
-    let provider = Provider::new(store);
+    let provider = Provider::new(store, kubeconfig.clone());
     let kubelet = Kubelet::new(provider, kubeconfig, config);
     kubelet.start().await
 }

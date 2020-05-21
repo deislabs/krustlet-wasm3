@@ -1,7 +1,7 @@
 use std::error;
 use std::fmt;
 
-use wasm3::{Environment, Module};
+use wasm3::Environment;
 
 type Result<T> = std::result::Result<T, RuntimeError>;
 
@@ -14,9 +14,9 @@ pub struct RuntimeError {
 enum RuntimeErrorKind {
     AlreadyStarted,
     CannotCreateRuntime,
-    CannotParseModule,
+    CannotLinkWASI,
     CannotLoadModule,
-    NoMainFunction,
+    NoEntrypoint,
     RunFailure,
 }
 
@@ -35,9 +35,9 @@ impl RuntimeError {
         match self.kind {
             RuntimeErrorKind::AlreadyStarted => "runtime already started",
             RuntimeErrorKind::CannotCreateRuntime => "cannot create runtime",
-            RuntimeErrorKind::CannotParseModule => "cannot parse module",
+            RuntimeErrorKind::CannotLinkWASI => "cannot link module to the WASI runtime",
             RuntimeErrorKind::CannotLoadModule => "cannot load module",
-            RuntimeErrorKind::NoMainFunction => "no function called 'main' found",
+            RuntimeErrorKind::NoEntrypoint => "no entrypoint function called '_start' found",
             RuntimeErrorKind::RunFailure => "failure during function call",
         }
     }
@@ -81,14 +81,13 @@ impl Runtime {
         let rt = env
             .create_runtime(self.stack_size)
             .map_err(|_| RuntimeError::new(RuntimeErrorKind::CannotCreateRuntime))?;
-        let module = Module::parse(&env, &self.module_bytes)
-            .map_err(|_| RuntimeError::new(RuntimeErrorKind::CannotParseModule))?;
-        let module = rt
-            .load_module(module)
+        let mut module = rt
+            .parse_and_load_module(&self.module_bytes)
             .map_err(|_| RuntimeError::new(RuntimeErrorKind::CannotLoadModule))?;
+        module.link_wasi().map_err(|_| RuntimeError::new(RuntimeErrorKind::CannotLinkWASI))?;
         let func = module
-            .find_function::<(), ()>("main")
-            .map_err(|_| RuntimeError::new(RuntimeErrorKind::NoMainFunction))?;
+            .find_function::<(), ()>("_start")
+            .map_err(|_| RuntimeError::new(RuntimeErrorKind::NoEntrypoint))?;
         self.current_status = RuntimeStatus::Running;
         // FIXME: run this in the background
         // for now, we block until the function is complete, then call .stop()
@@ -97,7 +96,7 @@ impl Runtime {
         self.stop()
     }
 
-    fn stop(&mut self) -> Result<()> {
+    pub fn stop(&mut self) -> Result<()> {
         // it is OK for the runtime to stop an already stopped module. Effectively a no-op
         self.current_status = RuntimeStatus::Stopped;
         Ok(())
