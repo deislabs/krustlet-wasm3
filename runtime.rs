@@ -5,15 +5,16 @@ use tempfile::NamedTempFile;
 use tokio::sync::watch::{self, Sender};
 use tokio::task::JoinHandle;
 use wasm3::{Environment, Module};
-use kubelet::handle::{RuntimeHandle, Stop};
-use kubelet::status::ContainerStatus;
+use kubelet::container::Handle as ContainerHandle;
+use kubelet::container::Status as ContainerStatus;
+use kubelet::handle::StopHandler;
 
-pub struct HandleStopper {
+pub struct Runtime {
     handle: JoinHandle<anyhow::Result<()>>,
 }
 
 #[async_trait::async_trait]
-impl Stop for HandleStopper {
+impl StopHandler for Runtime {
     async fn stop(&mut self) -> anyhow::Result<()> {
         // no nothing
         Ok(())
@@ -26,13 +27,13 @@ impl Stop for HandleStopper {
 }
 
 /// A runtime context for running a wasm module with wasm3
-pub struct Runtime {
+pub struct Wasm3Runtime {
     module_bytes: Vec<u8>,
     stack_size: u32,
     output: Arc<NamedTempFile>,
 }
 
-impl Runtime {
+impl Wasm3Runtime {
     pub async fn new<L: AsRef<Path> + Send + Sync + 'static>(module_bytes: Vec<u8>, stack_size: u32, log_dir: L) -> anyhow::Result<Self> {
         let temp = tokio::task::spawn_blocking(move || -> anyhow::Result<NamedTempFile> {
             Ok(NamedTempFile::new_in(log_dir)?)
@@ -46,7 +47,7 @@ impl Runtime {
         })
     }
 
-    pub async fn start(&mut self) -> anyhow::Result<RuntimeHandle<HandleStopper, LogHandleFactory>> {
+    pub async fn start(&mut self) -> anyhow::Result<ContainerHandle<Runtime, LogHandleFactory>> {
         let temp = self.output.clone();
         let output_write = tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
             Ok(temp.reopen()?)
@@ -64,10 +65,9 @@ impl Runtime {
             temp: self.output.clone(),
         };
 
-        Ok(RuntimeHandle::new(
-            HandleStopper{handle},
+        Ok(ContainerHandle::new(
+            Runtime{handle},
             log_handle_factory,
-            status_recv,
         ))
     }
 }
@@ -77,7 +77,7 @@ pub struct LogHandleFactory {
     temp: Arc<NamedTempFile>,
 }
 
-impl kubelet::handle::LogHandleFactory<tokio::fs::File> for LogHandleFactory {
+impl kubelet::log::HandleFactory<tokio::fs::File> for LogHandleFactory {
     /// Creates `tokio::fs::File` on demand for log reading.
     fn new_handle(&self) -> tokio::fs::File {
         tokio::fs::File::from_std(self.temp.reopen().unwrap())
@@ -94,20 +94,46 @@ async fn spawn_wasm3(
     _output_write: std::fs::File, //TODO: hook this up such that log output will be written to the file
 ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
     let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let env = Environment::new().expect("cannot create environment");
+
+        let env = match Environment::new() {
+            // We can't map errors here or it moves the send channel, so we
+            // do it in a match
+            Ok(m) => m,
+            Err(e) => {
+                let message = "cannot create environment";
+                error!("{}: {:?}", message, e);
+                send(
+                    status_sender.clone(),
+                    name,
+                    Status::Terminated {
+                        failed: true,
+                        message: message.into(),
+                        timestamp: chrono::Utc::now(),
+                    },
+                    &mut cx,
+                );
+                return Err(e);
+            }
+        }
+
         let rt = env.create_runtime(stack_size).expect("cannot create runtime");
+
         let module = Module::parse(&env, &module_bytes).expect("cannot parse module");
+
         let mut module = rt.load_module(module).expect("cannot load module");
+
         module.link_wasi().expect("cannot link WASI");
+
         let func = module.find_function::<(), ()>("_start").expect("cannot find function '_start' in module");
+
         func.call().expect("cannot call '_start' in module");
-        status_sender
-        .broadcast(ContainerStatus::Terminated {
+
+        status_sender.broadcast(ContainerStatus::Terminated {
             failed: false,
             message: "Module run completed".into(),
             timestamp: chrono::Utc::now(),
-        })
-        .expect("status should be able to send");
+        }).expect("status should be able to send");
+
         Ok(())
     });
 
